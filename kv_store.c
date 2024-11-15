@@ -6,6 +6,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>       // kmalloc 및 kfree를 위해
 #include <linux/uaccess.h>    // copy_to_user 및 copy_from_user를 위해
+#include <linux/device.h>     // class_create 및 device_create를 위해
 
 #define DEVICE_NAME "kv_store"
 #define CLASS_NAME "kv"
@@ -183,7 +184,7 @@ static int __init kv_store_init(void){
         printk(KERN_ALERT "디바이스 생성에 실패\n");
         return PTR_ERR(kvDevice);
     }
-    printk(KERN_INFO "kv_store: 디바이스 클래스가 정상적으로 생성됨\n"); // 성공적으로 초기화됨
+    printk(KERN_INFO "kv_store: 디바이스가 정상적으로 생성됨\n"); // 성공적으로 초기화됨
     return 0;
 }
 
@@ -208,3 +209,4 @@ static void __exit kv_store_exit(void){
 
 module_init(kv_store_init);
 module_exit(kv_store_exit);
+MODULE_LICENSE("GPL");
