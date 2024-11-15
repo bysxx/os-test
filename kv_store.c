@@ -6,7 +6,8 @@
 #include <linux/fs.h>
 #include <linux/slab.h>       // kmalloc 및 kfree를 위해
 #include <linux/uaccess.h>    // copy_to_user 및 copy_from_user를 위해
-#include <linux/device.h>     // class_create 및 device_create를 위해
+#include <linux/device.h>     // class_create, device_create 등을 위해
+#include <linux/mutex.h>      // 동기화를 위한 mutex 사용 (선택 사항)
 
 #define DEVICE_NAME "kv_store"
 #define CLASS_NAME "kv"
@@ -28,6 +29,9 @@ typedef struct kv_pair {
 } kv_pair_t;
 
 static kv_pair_t* head = NULL; // 링크드 리스트의 헤드
+
+// 동기화를 위한 mutex (선택 사항)
+static DEFINE_MUTEX(kv_mutex);
 
 // 함수 프로토타입
 static int dev_open(struct inode*, struct file*);
@@ -63,26 +67,42 @@ static ssize_t dev_read(struct file* filep, char* buffer, size_t len, loff_t* of
     ssize_t bytes_read = 0;
 
     // 사용자 공간에서 키 복사
+    if (len >= 256) {
+        printk(KERN_ALERT "kv_store: 키 길이가 너무 깁니다\n");
+        return -EINVAL;
+    }
+
     if (copy_from_user(key, buffer, len)){
         printk(KERN_ALERT "kv_store: 사용자로부터 키를 가져오는데 실패\n");
         return -EFAULT;
     }
     key[len] = '\0';
 
+    // 동기화 시작
+    mutex_lock(&kv_mutex);
+
     // 키 검색
     while (curr != NULL) {
         if (strcmp(curr->key, key) == 0) {
             size_t value_len = strlen(curr->value);
+
             if (copy_to_user(buffer, curr->value, value_len)) {
                 printk(KERN_ALERT "kv_store: 사용자에게 값을 보내는데 실패\n");
+                mutex_unlock(&kv_mutex);
                 return -EFAULT;
             }
             bytes_read = value_len;
             printk(KERN_INFO "kv_store: 키 '%s', 값 '%s' 읽음\n", key, curr->value);
+
+            // 동기화 종료
+            mutex_unlock(&kv_mutex);
             return bytes_read;
         }
         curr = curr->next;
     }
+
+    // 동기화 종료
+    mutex_unlock(&kv_mutex);
 
     // 키를 찾지 못함
     printk(KERN_INFO "kv_store: 키 '%s'를 찾지 못함\n", key);
@@ -97,7 +117,7 @@ static ssize_t dev_write(struct file* filep, const char* buffer, size_t len, lof
     kv_pair_t* curr = head;
     kv_pair_t* new_pair;
 
-    if (len > 512) {
+    if (len >= 512) {
         printk(KERN_ALERT "kv_store: 입력이 너무 깁니다\n");
         return -EINVAL;
     }
@@ -129,12 +149,18 @@ static ssize_t dev_write(struct file* filep, const char* buffer, size_t len, lof
     strncpy(value, delim_pos + 1, value_len);
     value[value_len] = '\0';
 
+    // 동기화 시작
+    mutex_lock(&kv_mutex);
+
     // 키가 이미 존재하는지 확인
     while (curr != NULL) {
         if (strcmp(curr->key, key) == 0) {
             // 값 업데이트
             strcpy(curr->value, value);
             printk(KERN_INFO "kv_store: 키 '%s'를 값 '%s'로 업데이트\n", key, value);
+
+            // 동기화 종료
+            mutex_unlock(&kv_mutex);
             return len;
         }
         curr = curr->next;
@@ -144,6 +170,7 @@ static ssize_t dev_write(struct file* filep, const char* buffer, size_t len, lof
     new_pair = kmalloc(sizeof(kv_pair_t), GFP_KERNEL);
     if (!new_pair) {
         printk(KERN_ALERT "kv_store: 메모리 할당에 실패\n");
+        mutex_unlock(&kv_mutex);
         return -ENOMEM;
     }
     strcpy(new_pair->key, key);
@@ -152,6 +179,9 @@ static ssize_t dev_write(struct file* filep, const char* buffer, size_t len, lof
     head = new_pair;
 
     printk(KERN_INFO "kv_store: 키 '%s'와 값 '%s' 추가\n", key, value);
+
+    // 동기화 종료
+    mutex_unlock(&kv_mutex);
     return len;
 }
 
@@ -171,7 +201,7 @@ static int __init kv_store_init(void){
     kvClass = class_create(THIS_MODULE, CLASS_NAME);
     if (IS_ERR(kvClass)){                // 오류 체크 및 정리
         unregister_chrdev(majorNumber, DEVICE_NAME);
-        printk(KERN_ALERT "디바이스 클래스 등록에 실패\n");
+        printk(KERN_ALERT "kv_store: 디바이스 클래스 등록에 실패\n");
         return PTR_ERR(kvClass);          // 포인터에서 오류 반환
     }
     printk(KERN_INFO "kv_store: 디바이스 클래스가 정상적으로 등록됨\n");
@@ -181,10 +211,14 @@ static int __init kv_store_init(void){
     if (IS_ERR(kvDevice)){               // 오류 발생 시 정리
         class_destroy(kvClass);
         unregister_chrdev(majorNumber, DEVICE_NAME);
-        printk(KERN_ALERT "디바이스 생성에 실패\n");
+        printk(KERN_ALERT "kv_store: 디바이스 생성에 실패\n");
         return PTR_ERR(kvDevice);
     }
     printk(KERN_INFO "kv_store: 디바이스가 정상적으로 생성됨\n"); // 성공적으로 초기화됨
+
+    // mutex 초기화
+    mutex_init(&kv_mutex);
+
     return 0;
 }
 
@@ -200,6 +234,9 @@ static void __exit kv_store_exit(void){
         kfree(tmp);
     }
 
+    // mutex 해제
+    mutex_destroy(&kv_mutex);
+
     device_destroy(kvClass, MKDEV(majorNumber, 0));     // 디바이스 제거
     class_unregister(kvClass);                          // 디바이스 클래스 등록 해제
     class_destroy(kvClass);                             // 디바이스 클래스 제거
@@ -209,4 +246,3 @@ static void __exit kv_store_exit(void){
 
 module_init(kv_store_init);
 module_exit(kv_store_exit);
-MODULE_LICENSE("GPL");
